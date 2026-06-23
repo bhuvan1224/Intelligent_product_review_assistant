@@ -1,12 +1,21 @@
 import streamlit as st
 import pandas as pd
 
-from gsmarena_scraper import get_brand_models
 from product_search import search_product
-from phone_specs import get_phone_specs
 from recommendation_engine import recommend_alternative
 from analysis import analyze_product
 from storage_variants import get_storage_variants
+
+from review_vector_store import (
+    store_reviews,
+    retrieve_reviews,
+    list_stored_reviews,
+    get_all_phones,
+    get_phone_metadata
+)
+
+from review_rag import analyze_reviews
+
 
 st.set_page_config(
     page_title="Intelligent Product Review Assistant",
@@ -21,41 +30,73 @@ st.write(
 )
 
 # --------------------------------------------------
-# BRAND SELECTION
+# BRAND & PHONE SELECTION (use Chroma as source)
 # --------------------------------------------------
 
-brands = [
-    "Apple",
-    "Samsung",
-    "Google",
-    "OnePlus",
-    "Nothing",
-    "Vivo",
-    "Oppo",
-    "Realme",
-    "Xiaomi",
-    "Motorola"
-]
+# get all phones stored in Chroma (metadata 'phone')
+all_phones = get_all_phones()
 
-selected_brand = st.selectbox(
-    "📱 Select Brand",
-    brands
-)
+# build brand->models map from stored metadata, infer brand if missing
+def _infer_brand_from_name(phone_name: str):
+    n = phone_name.lower()
+    if "iphone" in n:
+        return "Apple"
+    if "samsung" in n or "galaxy" in n:
+        return "Samsung"
+    if "pixel" in n:
+        return "Google"
+    if "oneplus" in n:
+        return "OnePlus"
+    if "nothing" in n:
+        return "Nothing"
+    if "vivo" in n:
+        return "Vivo"
+    if "oppo" in n:
+        return "Oppo"
+    if "realme" in n:
+        return "Realme"
+    if "xiaomi" in n or "redmi" in n or "mi" in n:
+        return "Xiaomi"
+    if "motorola" in n or "edge" in n:
+        return "Motorola"
+    return None
 
-# --------------------------------------------------
-# PHONE MODELS
-# --------------------------------------------------
+brand_map = {}
+for p in all_phones:
+    meta = get_phone_metadata(p)
+    brand = None
+    if isinstance(meta, dict):
+        b = meta.get("brand")
+        if isinstance(b, str) and b.strip() and b.strip().lower() != "unknown":
+            brand = b.strip()
 
-models = get_brand_models(selected_brand)
+    if not brand:
+        inferred = _infer_brand_from_name(p)
+        brand = inferred
 
-if not models:
-    st.error("No models found")
+    # skip entries where brand cannot be determined
+    if not brand:
+        continue
+
+    brand_map.setdefault(brand, []).append(p)
+
+# If Chroma has no phones, show error and instruct how to populate
+if not brand_map:
+    st.error(
+        "No phones found in Chroma DB. Populate the database first (use migrate or import scripts)."
+    )
+    st.info("Run: python migrate_phone_db_to_chroma.py --apply and/or import reviews")
     st.stop()
 
-selected_phone = st.selectbox(
-    "📲 Select Phone",
-    models
-)
+brands = sorted(brand_map.keys())
+selected_brand = st.selectbox("📱 Select Brand", brands)
+
+models = sorted(brand_map.get(selected_brand, []))
+if not models:
+    st.error("No models found in Chroma DB for this brand")
+    st.stop()
+
+selected_phone = st.selectbox("📲 Select Phone", models)
 
 # --------------------------------------------------
 # STORAGE VARIANTS
@@ -75,27 +116,35 @@ full_phone_name = (
 )
 
 # --------------------------------------------------
-# ANALYZE PRODUCT
+# ANALYZE PRODUCT (fetch everything from Chroma)
 # --------------------------------------------------
+if st.button("Analyze Product"):
 
-if st.button("🔍 Analyze Product"):
+    # Load reviews from Chroma
+    stored_items = list_stored_reviews(phone_name=selected_phone, limit=1000)
+    reviews = [it["document"] for it in stored_items]
 
-    with st.spinner("Fetching prices..."):
+    if not reviews:
+        st.warning("No reviews found in Chroma for this phone. Populate the DB first.")
 
-        data = search_product(
-            full_phone_name
-        )
+    # full phone display name
+    full_phone = f"{selected_phone} {selected_storage}"
 
-        specs = get_phone_specs(
-            selected_phone
-        )
+    # product search (prices) remains external
+    data = search_product(full_phone)
 
-        st.session_state["data"] = data
-        st.session_state["specs"] = specs
-        st.session_state["phone"] = selected_phone
-        st.session_state["storage"] = selected_storage
-        st.session_state["full_phone"] = full_phone_name
+    # specs come from Chroma metadata
+    specs = get_phone_metadata(selected_phone) or {}
+    # ensure expected keys exist
+    specs.setdefault("features", [])
+    specs.setdefault("pros", [])
+    specs.setdefault("cons", [])
 
+    st.session_state["data"] = data
+    st.session_state["specs"] = specs
+    st.session_state["phone"] = selected_phone
+    st.session_state["storage"] = selected_storage
+    st.session_state["full_phone"] = full_phone
 # --------------------------------------------------
 # RESULTS
 # --------------------------------------------------
@@ -105,8 +154,14 @@ if "data" in st.session_state:
     data = st.session_state["data"]
     specs = st.session_state["specs"]
     phone = st.session_state["phone"]
-    storage = st.session_state["storage"]
-    full_phone = st.session_state["full_phone"]
+    storage = st.session_state.get(
+    "storage",
+    "128GB"
+    )
+    full_phone = st.session_state.get(
+    "full_phone",
+    f"{selected_phone} {selected_storage}"
+    )
 
     st.markdown("---")
 
@@ -163,27 +218,75 @@ if "data" in st.session_state:
 
     st.markdown("---")
 
+    st.subheader(
+        "📝 Review Intelligence (RAG)"
+    )
+
+    try:
+
+        # Ensure 'priority' is available (comes from user input later). Use session state default if not set.
+        priority = st.session_state.get("priority", "Value")
+        priority = str(priority).lower()
+
+        retrieved_reviews = retrieve_reviews(
+
+            phone,
+
+            priority
+        )
+
+        st.subheader(
+            "🛒 Real Customer Reviews"
+        )
+
+        for review in retrieved_reviews[:10]:
+
+            st.write(
+                f"• {review}"
+            )
+
+        review_summary = analyze_reviews(
+
+            phone,
+
+            retrieved_reviews
+        )
+
+        st.subheader(
+            "🤖 AI Review Summary"
+        )
+
+        st.write(
+            review_summary
+        )
+
+    except Exception as e:
+
+        st.warning(
+            f"Review analysis unavailable: {e}"
+        )
+
     # --------------------------------------------------
     # FEATURES
     # --------------------------------------------------
 
     st.subheader("📋 Key Features")
 
-    for feature in specs["features"]:
+    for feature in specs.get("features", []):
         st.write(
             f"✅ {feature}"
         )
 
     st.subheader("👍 Pros")
 
-    for pro in specs["pros"]:
+    for pro in specs.get("pros", []):
         st.write(
             f"✔️ {pro}"
         )
 
     st.subheader("👎 Cons")
 
-    for con in specs["cons"]:
+    for con in specs.get("cons", []):
         st.write(
             f"❌ {con}"
         )

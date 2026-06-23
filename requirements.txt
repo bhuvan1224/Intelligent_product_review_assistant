@@ -4,3 +4,5 @@ google-search-results
 langchain
 langchain-groq
 requests
+chromadb
+sentence_transformers
