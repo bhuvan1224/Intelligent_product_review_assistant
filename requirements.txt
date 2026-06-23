@@ -6,7 +6,10 @@ langchain-groq
 groq
 requests
 beautifulsoup4
-chromadb==1.5.9
-sentence-transformers
-torch
 pandas
+
+chromadb==1.5.9
+sentence-transformers==2.7.0
+torch
+
+protobuf==3.20.3
